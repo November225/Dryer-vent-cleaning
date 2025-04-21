@@ -1,0 +1,213 @@
+import SwiftUI
+import AVFoundation
+import Vision
+import UIKit
+
+struct ContentView: View {
+    @State private var isShowingScanner = false
+    @State private var scannedText = ""
+    @State private var isSpeaking = false
+    private let speechSynthesizer = AVSpeechSynthesizer()
+
+    var body: some View {
+        VStack(spacing: 20) {
+            // Title
+            Text("Book Reader App")
+                .font(.largeTitle)
+                .fontWeight(.bold)
+
+            // Display scanned text
+            ScrollView {
+                Text(scannedText.isEmpty ? "No text scanned yet." : scannedText)
+                    .font(.body)
+                    .foregroundColor(.gray)
+                    .padding()
+            }
+            .frame(maxHeight: 200)
+
+            // Scan button
+            Button(action: {
+                isShowingScanner = true
+            }) {
+                Text("Scan")
+                    .font(.title2)
+                    .fontWeight(.semibold)
+                    .foregroundColor(.white)
+                    .padding()
+                    .frame(maxWidth: .infinity)
+                    .background(Color.blue)
+                    .cornerRadius(10)
+            }
+            .padding(.horizontal)
+
+            // Read aloud button (appears after scanning)
+            if !scannedText.isEmpty {
+                Button(action: {
+                    if isSpeaking {
+                        speechSynthesizer.stopSpeaking(at: .immediate)
+                        isSpeaking = false
+                    } else {
+                        let utterance = AVSpeechUtterance(string: scannedText)
+                        utterance.voice = AVSpeechSynthesisVoice(language: "en-US")
+                        utterance.rate = 0.5
+                        speechSynthesizer.speak(utterance)
+                        isSpeaking = true
+                    }
+                }) {
+                    Text(isSpeaking ? "Stop Reading" : "Read Aloud")
+                        .font(.title2)
+                        .fontWeight(.semibold)
+                        .foregroundColor(.white)
+                        .padding()
+                        .frame(maxWidth: .infinity)
+                        .background(Color.green)
+                        .cornerRadius(10)
+                }
+                .padding(.horizontal)
+            }
+        }
+        .padding()
+        .sheet(isPresented: $isShowingScanner) {
+            CameraView(scannedText: $scannedText, isPresented: $isShowingScanner)
+        }
+    }
+}
+
+// Camera View to capture video and extract text
+struct CameraView: UIViewControllerRepresentable {
+    @Binding var scannedText: String
+    @Binding var isPresented: Bool
+
+    func makeUIViewController(context: Context) -> CameraViewController {
+        let controller = CameraViewController()
+        controller.delegate = context.coordinator
+        return controller
+    }
+
+    func updateUIViewController(_ uiViewController: CameraViewController, context: Context) {}
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(self)
+    }
+
+    class Coordinator: NSObject, CameraViewControllerDelegate {
+        var parent: CameraView
+
+        init(_ parent: CameraView) {
+            self.parent = parent
+        }
+
+        func didFinishScanning(text: String) {
+            parent.scannedText = text
+            parent.isPresented = false
+        }
+
+        func didCancel() {
+            parent.isPresented = false
+        }
+    }
+}
+
+// Camera View Controller to handle video capture and text recognition
+protocol CameraViewControllerDelegate: AnyObject {
+    func didFinishScanning(text: String)
+    func didCancel()
+}
+
+class CameraViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDelegate {
+    weak var delegate: CameraViewControllerDelegate?
+    private var captureSession: AVCaptureSession?
+    private let visionQueue = DispatchQueue(label: "com.yourname.visionQueue")
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        setupCamera()
+        addCancelButton()
+    }
+
+    override func viewDidAppear(_ animated: Bool) {
+        super.viewDidAppear(animated)
+        captureSession?.startRunning()
+    }
+
+    override func viewWillDisappear(_ animated: Bool) {
+        super.viewWillDisappear(animated)
+        captureSession?.stopRunning()
+    }
+
+    private func setupCamera() {
+        captureSession = AVCaptureSession()
+        captureSession?.sessionPreset = .high
+
+        guard let captureDevice = AVCaptureDevice.default(for: .video),
+              let input = try? AVCaptureDeviceInput(device: captureDevice) else {
+            delegate?.didCancel()
+            return
+        }
+
+        if let session = captureSession, session.canAddInput(input) {
+            session.addInput(input)
+        }
+
+        let previewLayer = AVCaptureVideoPreviewLayer(session: captureSession!)
+        previewLayer.frame = view.layer.bounds
+        previewLayer.videoGravity = .resizeAspectFill
+        view.layer.addSublayer(previewLayer)
+
+        let output = AVCaptureVideoDataOutput()
+        output.setSampleBufferDelegate(self, queue: visionQueue)
+        if let session = captureSession, session.canAddOutput(output) {
+            session.addOutput(output)
+        }
+    }
+
+    private func addCancelButton() {
+        let cancelButton = UIButton(type: .system)
+        cancelButton.setTitle("Cancel", for: .normal)
+        cancelButton.setTitleColor(.white, for: .normal)
+        cancelButton.backgroundColor = .red
+        cancelButton.layer.cornerRadius = 10
+        cancelButton.translatesAutoresizingMaskIntoConstraints = false
+        cancelButton.addTarget(self, action: #selector(cancelTapped), for: .touchUpInside)
+        view.addSubview(cancelButton)
+
+        NSLayoutConstraint.activate([
+            cancelButton.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -20),
+            cancelButton.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            cancelButton.widthAnchor.constraint(equalToConstant: 100),
+            cancelButton.heightAnchor.constraint(equalToConstant: 50)
+        ])
+    }
+
+    @objc private func cancelTapped() {
+        delegate?.didCancel()
+    }
+
+    // Process video frames to extract text
+    func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
+        guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+
+        let request = VNRecognizeTextRequest { [weak self] (request, error) in
+            guard let observations = request.results as? [VNRecognizedTextObservation], !observations.isEmpty else { return }
+            let recognizedStrings = observations.compactMap { observation in
+                observation.topCandidates(1).first?.string
+            }
+            let text = recognizedStrings.joined(separator: "\n")
+            if !text.isEmpty {
+                DispatchQueue.main.async {
+                    self?.delegate?.didFinishScanning(text: text)
+                }
+            }
+        }
+
+        request.recognitionLevel = .accurate
+        request.usesLanguageCorrection = true
+
+        let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, options: [:])
+        try? handler.perform([request])
+    }
+}
+
+#Preview {
+    ContentView()
+}
